@@ -20,9 +20,9 @@
 
 RQ-VAE（Residual-Quantized Variational AutoEncoder）用于生成具有语义层级结构的离散 Semantic ID。其核心思想是利用**残差量化**技术，将连续的语义向量由粗到细地拆解为多个离散编码。
 
-> ![[Clipboard_Screenshot_1770291592.png]]
+<img width="2593" height="1061" alt="Clipboard_Screenshot_1770366836" src="https://github.com/user-attachments/assets/edb2d556-40aa-43b8-8568-f95a5ea90db7" />
 
-(1) **语义特征提取与降维 **，首先将物品的原始内容特征转化为适合量化的低维潜在向量：
+(1) **语义特征提取与降维**，首先将物品的原始内容特征转化为适合量化的低维潜在向量：
 *   **语义嵌入**：使用预训练编码器将物品的多模态内容特征（标题、描述、图片等）转化为高维语义嵌入向量 $\mathbf{x} \in \mathbb{R}^{768}$
 *   **降维映射**：使用一个 DNN Encoder 将 $\mathbf{x}$ 映射为低维潜在向量 $\mathbf{z} \in \mathbb{R}^{32}$，作为量化过程的初始输入 $r_0$，DNN Encoder 由三层 MLP 组成（维度 512-256-128，激活函数 ReLU），最终输出维度
 
@@ -40,7 +40,7 @@ RQ-VAE（Residual-Quantized Variational AutoEncoder）用于生成具有语义�
 *   **Semantic ID**：基础形式为 $(c_0, c_1, c_2)$。为了解决不同物品映射到相同 ID 的**碰撞问题**，TIGER 会追加**第 4 位 Token**（如 0, 1...）以确保每个物品 ID 的唯一性。
 *   **量化后的潜在向量**：$\hat{\mathbf{z}} = \sum_{d=0}^{M-1} \mathbf{e}_{c_d}$。
 
-(4) ** 解码与重构**
+(4) **解码与重构**
 *   将 $\hat{\mathbf{z}}$ 输入到一个与 Encoder 架构一致的 DNN Decoder，输出重构向量 $\hat{\mathbf{x}} \in \mathbb{R}^{768}$。
 
 (5) **损失函数**，包含两部分：
