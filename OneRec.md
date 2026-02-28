@@ -112,7 +112,9 @@ cd ..
 ### 2. 下载 RecIF-Bench 官方数据集
 从项目根目录执行，确保数据进入 `raw_data` 文件夹。
 ```bash
-export HF_TOKEN=hf_xxxxxxxxxxxxxxxxxxxxxxxxxx
+pip install huggingface_hub
+
+export HF_TOKEN=<Create your token in https://huggingface.co/settings/tokens>
 
 # 1. 下载通用预训练 & SFT 数据 (用于协同训练)
 hf download OpenOneRec/OpenOneRec-General-Pretrain \
@@ -130,8 +132,6 @@ hf download OpenOneRec/OpenOneRec-RecIF \
     --repo-type dataset \
     --token $HF_TOKEN \
     --local-dir ./raw_data/onerec_data
-
-token $HF_TOKEN --local-dir ./raw_data/general_text/sft
 ```
 
 
@@ -210,7 +210,7 @@ The attention mask is not set and cannot be inferred from input because pad toke
 在官方 `RecIF` 数据集中，物品的语义 ID（SID）和标题（Caption）通常分布在各领域的元数据文件中（如 `video_metadata.parquet`）。我们需要从下载的 `raw_data` 中提取出 `run.sh` 能够识别的 `pid2sid` 和 `caption` 文件。
 
 ### 2.1 创建转换脚本
-在项目根目录下创建文件`prepare_mappings.py`，运行`python3 prepare_mappings.py`。
+在项目根目录下创建文件`prepare_mappings.py`，运行`python prepare_mappings.py`。
 ```python
 import pandas as pd
 import numpy as np
@@ -280,6 +280,70 @@ def main():
 if __name__ == "__main__":
     main()
 ```
+
+```python
+import pandas as pd
+import numpy as np
+import os
+from concurrent.futures import ProcessPoolExecutor
+
+RAW_DATA_DIR = './raw_data/onerec_data'
+OUTPUT_DIR = './data/onerec_data/pretrain'
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+def fast_vectorized_sid(df):
+    """
+    使用 NumPy 矩阵操作将 [s_a, s_b, s_c] 列表向量化转换为 OneRec 字符串
+    """
+    if df.empty:
+        return df[['pid', 'sid']]
+    
+    sid_matrix = np.stack(df['sid'].values)
+    
+    df['sid'] = [
+        f"<|sid_begin|><s_a_{a}><s_b_{b}><s_c_{c}><|sid_end|>" 
+        for a, b, c in sid_matrix
+    ]
+    
+    return df[['pid', 'sid']]
+
+
+def process_single_sid_file(file_name):
+    """并行任务单元：处理单个 SID 文件"""
+    path = os.path.join(RAW_DATA_DIR, file_name)
+    if os.path.exists(path):
+        df = pd.read_parquet(path, columns=['pid', 'sid'])
+        return fast_vectorized_sid(df)
+    return None
+
+def main():
+
+    cap_file = os.path.join(RAW_DATA_DIR, 'pid2caption.parquet')
+    if os.path.exists(cap_file):
+        df_cap = pd.read_parquet(cap_file, columns=['pid', 'dense_caption'])
+        df_cap.to_parquet(os.path.join(OUTPUT_DIR, 'behavior_caption.parquet'), index=False)
+
+    sid_files = ['video_ad_pid2sid.parquet', 'product_pid2sid.parquet']
+    
+    with ProcessPoolExecutor() as executor:
+        results = list(executor.map(process_single_sid_file, sid_files))
+    
+    final_dfs = [r for r in results if r is not None]
+    if final_dfs:
+        full_sid_df = pd.concat(final_dfs, ignore_index=True)
+        full_sid_df.to_parquet(
+            os.path.join(OUTPUT_DIR, 'behavior_pid2sid.parquet'), 
+            index=False,
+            engine='pyarrow'
+        )
+
+    print(f"数据输出目录: {OUTPUT_DIR}")
+
+if __name__ == "__main__":
+    main()
+```
+
+
 串行化版本，防止出现`raise self._exception concurrent.futures.process.BrokenProcessPool: A process in the process pool was terminated abruptly while the future was running or pending.`
 ```python
 import pandas as pd
@@ -402,6 +466,40 @@ print(df_sid.head(1))
 """
 ```
 
+
+```python
+import pyarrow.parquet as pq
+
+# --- behavior_caption.parquet ---
+print("--- behavior_caption.parquet ---")
+pf_cap = pq.ParquetFile('./data/onerec_data/pretrain/behavior_caption.parquet')
+print(f"总行数: {pf_cap.metadata.num_rows}, 列: {pf_cap.schema.names}")
+df_cap = next(pf_cap.iter_batches(batch_size=1)).to_pandas()
+print(df_cap)
+
+# --- behavior_pid2sid.parquet ---
+print("\n--- behavior_pid2sid.parquet ---")
+pf_sid = pq.ParquetFile('./data/onerec_data/pretrain/behavior_pid2sid.parquet')
+print(f"总行数: {pf_sid.metadata.num_rows}, 列: {pf_sid.schema.names}")
+df_sid = next(pf_sid.iter_batches(batch_size=1)).to_pandas()
+print(df_sid)
+
+```
+
+输出内容如下：
+```bash
+--- behavior_caption.parquet ---
+总行数: 12660465, 列: ['pid', 'dense_caption']
+    pid                 dense_caption
+0  241922  这是一个关于展示化妆品和美妆产品使用效果的视频。视频中一位女性展示了她的化妆技巧，她用一款名...
+
+--- behavior_pid2sid.parquet ---
+总行数: 17951318, 列: ['pid', 'sid']
+    pid                    sid
+0  13508074  <|sid_begin|><s_a_1636><s_b_1470><s_c_676><|si...
+```
+
+
 ## 3. 生成语义对齐预训练数据
 
 ### 3.1 配置 `data/onerec_data/run.sh`
@@ -439,6 +537,7 @@ SEED=42
 ```
 
 ### 3.2 运行生成
+这个过程可能耗时很长。
 ```bash
 cd data/onerec_data
 bash run.sh
@@ -457,7 +556,7 @@ MAX_ROWS=1000
 ENGINE="pyarrow"
 ```
 
-在项目根下执行：
+在项目根下执行，这个过程可能耗时很长。
 
 ```bash
 mkdir -p raw_data/general_text/empty_general
@@ -506,10 +605,13 @@ bash prepare_pretrain.sh
 
 ```bash
 # 修改 1：指向扩充词表后的模型路径
-MODEL_DIR=/workspace/OpenOneRec/model/Qwen3-1.7B_itemic
+MODEL_DIR=../model/Qwen3-1.7B_itemic
 
 # 修改 2：指向保存训练结果的目录
-OUTPUT_DIR=/workspace/OpenOneRec/output/stg1_training_results
+OUTPUT_DIR=./output/stg1_training_results
+
+# 修改 3：使用 hostname 获取本机 IP
+MASTER_ADDR=$(hostname -i)
 ```
 
 ### 2.2 启动训练
@@ -519,6 +621,7 @@ OUTPUT_DIR=/workspace/OpenOneRec/output/stg1_training_results
 # source set_env.sh
 bash examples/pretrain_stg1.sh
 ```
+启动训练后在`OpenOneRec/pretrain/output/stg1_training_results`路径下查看实验结果。
 
 > 对于LD_PRELOAD 路径错误，几乎每个命令都弹出 ERROR: ld.so: object '...' cannot be preloaded，这是因为环境变量里强行指定了一个不存在的 NCCL 库文件，因此运行脚本前取消该设置： 打开脚本同目录下的 .env 文件，查找 LD_PRELOAD 这一行，直接删除或注释掉该行让系统使用默认的 libnccl.so。
 
@@ -532,17 +635,49 @@ bash examples/pretrain_stg1.sh
 > cat /etc/mpi/hostfile
 > ```
 
+> 如果遇到`mpirun: command not found`首先查找OpenMPI在什么位置：
+>  ```bash
+>  which mpirun
+>  # 如果没结果，试试：
+>  find /usr -name mpirun 2>/dev/null
+>  find /opt -name mpirun 2>/dev/null
+>  ```
+>  如果没有，可以使用conda安装下载。
+>  ```bash
+>  conda install conda-forge::openmpi
+>  ```
+
+> 如果找到了（例如在 `/usr/mpi/gcc/openmpi-4.1.7a1/bin/mpirun`），将其加入环境变量：
 > ```bash
-> pip install https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.5cxx11abiFALSE-cp311-cp311-linux_x86_64.whl
+> export PATH=/usr/mpi/gcc/openmpi-4.1.7a1/bin/:$PATH
+> ```
+
+> 验证一下：
+> ```bash
+> (torch-base) openmpi-3.1.0$ mpirun --version
+> mpirun (Open MPI) 4.1.7a1
+> ```
+
+ > 如果遇到`ImportError: FlashAttention2 has been toggled on, but it cannot be used due to the following error: the package flash_attn seems to be not installed. Please refer to the documentation of https://huggingface.co/docs/transformers/perf_infer_gpu_one#flashattention-2 to install Flash Attention 2.`
+> ```bash
+> pip install https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.5cxx11abiFALSE-cp312-cp312-linux_x86_64.whl
+> ```
+
+> 如果遇到 ``ImportError: /lib64/libc.so.6: version `GLIBC_2.32' not found (required by /opt/conda/envs/torch-base/lib/python3.12/site-packages/flash_attn_2_cuda.cpython-312-x86_64-linux-gnu.so)``，系统的 **glibc 版本太低**，预编译的 flash-attention wheel 需要 GLIBC 2.32，但系统只有更低版本。
+> ```bash
+> # 卸载预编译版本
+> pip uninstall flash-attn -y
+> # 从源码编译安装（需要较长时间，约10-30分钟）
+> pip install flash-attn --no-build-isolation
 > ```
 
 # OneRec 模型转换与验证
 
-训练生成的 Checkpoint 为分布式分片格式，需转换为标准的 HuggingFace 格式才能进行推理或 Stage 2 训练。
+2000个step后Stage 1 训练完成，此时训练损失收敛到1.90附近。训练生成的 Checkpoint 为分布式分片格式，需转换为标准的 HuggingFace 格式才能进行推理或 Stage 2 训练。
 
 ## 1. 模型格式转换 (Checkpoint to HF)
 
-使用项目提供的转换脚本，将指定的训练步数（如 step 500）转换为 HF 格式：
+使用项目提供的转换脚本，将指定的训练步数（如 step 2000）转换为 HF 格式：
 
 ```bash
 cd pretrain
@@ -551,22 +686,22 @@ cd pretrain
 # 参数：<扩充词表后的初始模型路径> <训练输出目录> <转换步数>
 bash scripts/convert_checkpoint_to_hf.sh \
     ../model/Qwen3-1.7B_itemic \
-    ../output/stg1_training_results \
-    800
+    ./output/stg1_training_results \
+    2000
 
 # 转换后的模型将保存在：
-# ../output/stg1_checkpoints/step800/global_step800/converted/
+# ../output/stg1_checkpoints/step2000/global_step2000/converted/
 ```
 
 ## 2. 验证对齐效果
 
-使用转换后的模型进行简单测试，验证其是否能根据语义 ID 理解物品内容：
+在`pretrain`目录下运行以下代码，验证模型是否能根据语义 ID 理解物品内容：
 
 ```python
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 # 指向转换后的 HF 模型目录
-model_path = "output/stg1_training_results/step800/global_step800/converted/"
+model_path = "output/stg1_training_results/step2000/global_step2000/converted/"
 
 tokenizer = AutoTokenizer.from_pretrained(model_path)
 model = AutoModelForCausalLM.from_pretrained(model_path, device_map="auto")
@@ -582,4 +717,21 @@ inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
 outputs = model.generate(**inputs, max_new_tokens=512)
 
 print(tokenizer.decode(outputs[0], skip_special_tokens=True))
+```
+经过测试模型此时还不具备语义对齐的能力：
+```bash
+ 视频<|sid_begin|><s_a_340><s_b_6566><s_c_5603><|sid_end|> 展示了以下内容： 
+ 
+ 1. 1987年，美国电影《星球大战》（Star Wars）首次上映，这是第一部由乔治·卢卡斯执导的科幻电影，开启了科幻电影的黄金时代。 
+ 2. 1997年，美国电影《黑客帝国》（The Matrix）上映，这部电影以其独特的视觉效果和哲学主题，成为科幻电影的经典之作。 
+ 3. 1999年，美国电影《终结者2》（Terminator 2）上映，这部电影以其对末日场景的描绘和对人工智能的探讨，成为科幻电影的又一里程碑。 
+ 4. 2001年，美国电影《阿凡达》（Avatar）上映，这部电影以其宏大的视觉效果和对环境保护的探讨，成为科幻电影的又一里程碑。 
+ 5. 2003年，美国电影《盗梦空间》（Inception）上映，这部电影以其复杂的剧情和对梦境的探讨，成为科幻电影的又一里程碑。 
+ 6. 2006年，美国电影《阿凡达》（Avatar）上映，这部电影以其宏大的视觉效果和对环境保护的探讨，成为科幻电影的又一里程碑。 
+ 7. 2008年，美国电影《钢铁侠》（Iron Man）上映，这部电影以其对科技与英雄的探讨，成为科幻电影的又一里程碑。 
+ 8. 2010年，美国电影《复仇者联盟》（Avengers）上映，这部电影以其对超级英雄的探讨，成为科幻电影的又一里程碑。 
+ 9. 2011年，美国电影《星际穿越》（Interstellar）上映，这部电影以其对宇宙和时间的探讨，成为科幻电影的又一里程碑。 
+ 10. 2015年，美国电影《阿凡达》（Avatar）上映，这部电影以其宏大的视觉效果和对环境保护的探讨，成为科幻电影的又一里程碑。 
+ 11. 2017年，美国电影《复仇者联盟3》（Avengers: Age of Ultron）上映，这部电影以其对超级英雄的探讨，成为科幻电影的又一里程碑。 
+ 12. 2019年，美国电影《阿凡达》（Avatar）上映，这部电影以其宏大的视觉效果和对环境保护的探讨，成为科幻电影的又
 ```
